@@ -1,7 +1,13 @@
+# cd chat
+# bundle install
+# bundle exec ruby web.rb -sv
+# http://chat.x:9000/
 require 'goliath'
 require 'redis'
 require 'json'
 require 'rack/utils'
+require 'debugger'
+require 'goliath/rack/templates'
 
 module Options
   def self.redis
@@ -14,54 +20,47 @@ module Options
   end
 end
 
-class Subscribe < Goliath::API
-  def response(env)
-    EM.synchrony do
-      @redis = Redis.new(Options::redis)
-      channel = env["REQUEST_PATH"].sub(/^\/subscribe\//, '')
-      @redis.subscribe(channel) do |on|
-        on.message do |channel, message|
-          @message = message
-          env.stream_send(payload)
-        end
-      end
-    end
+class Server < Goliath::API
+  include Goliath::Rack::Templates      # render templated files from ./views
+  use Goliath::Rack::Params
 
-    streaming_response(200, { 'Content-Type' => "text/event-stream" })
-  end
-
-  def on_close(env)
-    @redis.disconnect
-  end
+  @@redis = Redis.new(Options::redis)
 
   def payload
     "id: #{Time.now}\n" +
     "data: #{@message}" +
     "\r\n\n"
   end
-end
-
-class Receive < Goliath::API
-  @@redis = Redis.new(Options::redis)
 
   def response(env)
-    channel = env["REQUEST_PATH"][1..-1]
-    message = Rack::Utils.escape_html(params["message"])
-    @@redis.publish(channel, {sender: params["sender"], message: message}.to_json)
-    [ 200, { }, [ ] ]
-  end
-end
+    case env['PATH_INFO']
+    when '/'
+      [200, {}, erb(:index)]
+    when /^\/subscribe.*/
+      EM.synchrony do
+        @redis = Redis.new(Options::redis)
+        channel = env["REQUEST_PATH"].sub(/^\/subscribe\//, '')
+        puts channel
+        @redis.subscribe(channel) do |on|
+          on.message do |channel, message|
+            @message = message
+            env.stream_send(payload)
+          end
+        end
+      end
 
-class Server < Goliath::API
-  map "/" do
-    run Rack::File.new(File.join(File.dirname(__FILE__), 'public', 'index.html'))
+      streaming_response(200, { 'Content-Type' => "text/event-stream" })
+    when /.*/
+      channel = env["REQUEST_PATH"][1..-1]
+      message = Rack::Utils.escape_html(params["message"])
+      @@redis.publish(channel, {sender: params["sender"], message: message}.to_json)
+      [ 200, { }, [ ] ]
+    else
+      raise Goliath::Validation::NotFoundError
+    end
   end
 
-  map /^\/subscribe.*/ do
-    run Subscribe.new
-  end
-
-  map /.*/ do
-    run Receive.new
+  def on_close(env)
+    # @redis.disconnect if @redis && env['PATH_INFO'].match(/^\/subscribe.*/)
   end
 end
